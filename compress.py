@@ -82,7 +82,7 @@ def create_backup(file_path, backup_dir):
         raise
 
 
-def compress_pdf(input_file, output_file, dpi=150, quality="ebook", logger=None):
+def compress_pdf(input_file, output_file, color_image_dpi=150, quality="ebook", logger=None):
     """Compress a single PDF file"""
     if logger is None:
         logger = logging.getLogger(__name__)
@@ -92,7 +92,7 @@ def compress_pdf(input_file, output_file, dpi=150, quality="ebook", logger=None)
     try:
         logger.info(f"Starting compression: {input_file}")
         logger.info(f"Output file: {output_file}")
-        logger.info(f"Settings - DPI: {dpi}, Quality: {quality}")
+        logger.info(f"Settings - Color Image DPI: {color_image_dpi}, Quality: {quality}")
 
         # Get original file size
         original_size = get_file_size(input_file)
@@ -107,7 +107,7 @@ def compress_pdf(input_file, output_file, dpi=150, quality="ebook", logger=None)
             "-dNOPAUSE",
             "-dQUIET",
             "-dBATCH",
-            f"-r{dpi}",
+            f"-dColorImageResolution={color_image_dpi}",
             f"-sOutputFile={output_file}",
             input_file
         ]
@@ -205,7 +205,7 @@ def get_relative_path(file_path, base_path):
         return Path(file_path).name
 
 
-def compress_all_pdfs_in_directory(directory, dpi=150, quality="ebook", replace_originals=False, recursive=True):
+def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="ebook", replace_originals=False, recursive=True):
     """Compress all PDFs in a directory and optionally its subdirectories"""
     directory = Path(directory)
 
@@ -219,7 +219,7 @@ def compress_all_pdfs_in_directory(directory, dpi=150, quality="ebook", replace_
         logger.info("=" * 50)
         logger.info(f"Source directory: {directory}")
         logger.info(f"Recursive processing: {recursive}")
-        logger.info(f"DPI setting: {dpi}")
+        logger.info(f"Color Image DPI setting: {color_image_dpi}")
         logger.info(f"Quality setting: {quality}")
         logger.info(f"Replace originals: {replace_originals}")
 
@@ -292,7 +292,7 @@ def compress_all_pdfs_in_directory(directory, dpi=150, quality="ebook", replace_
                     backup_dir.mkdir(parents=True, exist_ok=True)
 
                 # Compress PDF
-                result = compress_pdf(str(pdf), str(output_path), dpi, quality, logger)
+                result = compress_pdf(str(pdf), str(output_path), color_image_dpi, quality, logger)
 
                 if result['success']:
                     total_original_size += result['original_size']
@@ -376,15 +376,15 @@ def main():
             "No: Process only PDFs in the selected folder"
         )
 
-        # Get DPI setting
-        dpi = simpledialog.askinteger(
-            "DPI Setting",
-            "Enter DPI (72=low quality, 150=medium, 300=high):",
+        # Get Color Image DPI setting
+        color_image_dpi = simpledialog.askinteger(
+            "Color Image DPI Setting",
+            "Enter Color Image DPI (72=low quality, 150=medium, 300=high):",
             initialvalue=150,
             minvalue=72,
             maxvalue=600
         )
-        if dpi is None:
+        if color_image_dpi is None:
             return
 
         # Ask about replacing originals
@@ -395,13 +395,12 @@ def main():
             "No: Compressed files will be saved to a new folder"
         )
 
-
         quality = "screen"  # Default quality setting
 
         print("Please wait while the PDFs are being compressed...")
         print("Check the console and log files for detailed progress...")
 
-        compress_all_pdfs_in_directory(folder, dpi, quality, replace_originals, recursive)
+        compress_all_pdfs_in_directory(folder, color_image_dpi, quality, replace_originals, recursive)
 
     except Exception as e:
         logging.error(f"Application error: {e}")
