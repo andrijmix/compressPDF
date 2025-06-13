@@ -387,26 +387,6 @@ def main():
         if dpi is None:
             return
 
-        # Get quality setting
-        quality_options = {
-            "Screen (lowest quality, smallest size)": "screen",
-            "eBook (medium quality, medium size)": "ebook",
-            "Printer (high quality, larger size)": "printer",
-            "Prepress (highest quality, largest size)": "prepress"
-        }
-
-        quality_dialog = tk.Toplevel()
-        quality_dialog.title("Quality Setting")
-        quality_dialog.geometry("400x200")
-        quality_dialog.resizable(False, False)
-
-        selected_quality = tk.StringVar(value="ebook")
-
-        tk.Label(quality_dialog, text="Select compression quality:", font=("Arial", 10)).pack(pady=10)
-
-        for desc, val in quality_options.items():
-            tk.Radiobutton(quality_dialog, text=desc, variable=selected_quality, value=val).pack(anchor="w", padx=20)
-
         # Ask about replacing originals
         replace_originals = messagebox.askyesno(
             "Replace Original Files?",
@@ -415,13 +395,8 @@ def main():
             "No: Compressed files will be saved to a new folder"
         )
 
-        def on_ok():
-            quality_dialog.destroy()
 
-        tk.Button(quality_dialog, text="OK", command=on_ok, width=10).pack(pady=20)
-
-        quality_dialog.wait_window()
-        quality = selected_quality.get()
+        quality = "screen"  # Default quality setting
 
         print("Please wait while the PDFs are being compressed...")
         print("Check the console and log files for detailed progress...")

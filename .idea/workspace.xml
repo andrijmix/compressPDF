@@ -4,9 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="b5a7ca49-a234-430f-a304-16c2ad4d73d5" name="Changes" comment="initial commit">
-      <change afterPath="$PROJECT_DIR$/compress_v2.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/file_service.py" afterDir="false" />
+    <list default="true" id="b5a7ca49-a234-430f-a304-16c2ad4d73d5" name="Changes" comment="Add PDF compression application with logging and file management features">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/compress.py" beforeDir="false" afterPath="$PROJECT_DIR$/compress.py" afterDir="false" />
     </list>
@@ -165,12 +163,32 @@
       <option name="project" value="LOCAL" />
       <updated>1749796478375</updated>
     </task>
-    <option name="localTasksCounter" value="2" />
+    <task id="LOCAL-00002" summary="Add PDF compression application with logging and file management features">
+      <option name="closed" value="true" />
+      <created>1749805948236</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1749805948236</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
     <servers />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State />
+          </value>
+        </entry>
+      </map>
+    </option>
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="initial commit" />
-    <option name="LAST_COMMIT_MESSAGE" value="initial commit" />
+    <MESSAGE value="Add PDF compression application with logging and file management features" />
+    <option name="LAST_COMMIT_MESSAGE" value="Add PDF compression application with logging and file management features" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>
