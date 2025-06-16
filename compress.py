@@ -1,173 +1,4 @@
-def compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi=150, quality="ebook",
-                                                      replace_originals=False, recursive=True, create_backup=True):
-    """Compress all PDFs in a directory with backup option control"""
-    directory = Path(directory)
-
-    # Setup logging
-    log_dir = directory / "compression_logs"
-    logger = setup_logging(log_dir)
-
-    try:
-        logger.info("=" * 50)
-        logger.info("PDF COMPRESSION SESSION STARTED")
-        logger.info("=" * 50)
-        logger.info(f"Source directory: {directory}")
-        logger.info(f"Recursive processing: {recursive}")
-        logger.info(f"Color Image DPI setting: {color_image_dpi}")
-        logger.info(f"Quality setting: {quality}")
-        logger.info(f"Replace originals: {replace_originals}")
-        logger.info(f"Create backup: {create_backup}")
-
-        # Create output directory
-        if replace_originals:
-            output_base_dir = directory / "temp_compressed"
-            backup_base_dir = directory / "original_backups" if create_backup else None
-        else:
-            output_base_dir = directory.parent / f"{directory.name}_compressed_pdfs"
-            backup_base_dir = None
-
-        output_base_dir.mkdir(exist_ok=True)
-        if backup_base_dir:
-            backup_base_dir.mkdir(exist_ok=True)
-
-        logger.info(f"Output base directory: {output_base_dir}")
-        if backup_base_dir:
-            logger.info(f"Backup base directory: {backup_base_dir}")
-
-        # Find PDF files
-        pdf_files = find_all_pdfs(directory, recursive)
-        if not pdf_files:
-            message = f"No PDF files found in the selected folder{' and its subdirectories' if recursive else ''}."
-            logger.warning(message)
-            messagebox.showinfo("Info", message)
-            return
-
-        logger.info(f"Found {len(pdf_files)} PDF files to compress")
-
-        # Group files by directory for better logging
-        files_by_dir = {}
-        for pdf_file in pdf_files:
-            parent_dir = pdf_file.parent
-            if parent_dir not in files_by_dir:
-                files_by_dir[parent_dir] = []
-            files_by_dir[parent_dir].append(pdf_file)
-
-        logger.info(f"Files distributed across {len(files_by_dir)} directories:")
-        for dir_path, files in files_by_dir.items():
-            rel_dir = get_relative_path(dir_path, directory)
-            logger.info(f"  {rel_dir}: {len(files)} files")
-
-        # Process each PDF
-        successful_compressions = 0
-        failed_compressions = 0
-        total_original_size = 0
-        total_compressed_size = 0
-
-        for i, pdf in enumerate(pdf_files, 1):
-            try:
-                # Get relative path for better logging
-                rel_path = get_relative_path(pdf, directory)
-                logger.info(f"\n--- Processing file {i}/{len(pdf_files)}: {rel_path} ---")
-
-                # Create output path maintaining directory structure
-                if replace_originals:
-                    # For replacement, maintain the same relative structure in temp directory
-                    relative_pdf_path = pdf.relative_to(directory)
-                    output_path = output_base_dir / relative_pdf_path
-                    backup_dir = backup_base_dir / relative_pdf_path.parent if backup_base_dir else None
-                else:
-                    # For separate output, maintain directory structure
-                    relative_pdf_path = pdf.relative_to(directory)
-                    output_path = output_base_dir / relative_pdf_path
-                    backup_dir = None
-
-                # Create output directory if it doesn't exist
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                if backup_dir:
-                    backup_dir.mkdir(parents=True, exist_ok=True)
-
-                # Compress PDF
-                result = compress_pdf(str(pdf), str(output_path), color_image_dpi, quality, logger)
-
-                if result['success']:
-                    total_original_size += result['original_size']
-                    total_compressed_size += result['compressed_size']
-
-                    # Replace original if requested
-                    if replace_originals:
-                        try:
-                            if create_backup:
-                                replace_original_file(pdf, output_path, backup_dir, logger)
-                            else:
-                                # Replace without backup
-                                shutil.move(str(output_path), str(pdf))
-                                logger.info(f"Original file replaced without backup: {pdf}")
-                        except Exception as e:
-                            logger.error(f"Failed to replace original file: {e}")
-                            failed_compressions += 1
-                            continue
-
-                    successful_compressions += 1
-                    logger.info(f"✓ Successfully processed: {rel_path}")
-
-            except Exception as e:
-                failed_compressions += 1
-                rel_path = get_relative_path(pdf, directory)
-                logger.error(f"✗ Failed to process {rel_path}: {e}")
-                messagebox.showerror("Error", f"Failed to compress '{rel_path}': {e}")
-
-        # Clean up temp directory if replacing originals
-        if replace_originals and output_base_dir.exists():
-            try:
-                shutil.rmtree(output_base_dir)
-                logger.info("Temporary directory cleaned up")
-            except Exception as e:
-                logger.warning(f"Failed to clean up temporary directory: {e}")
-
-        # Summary
-        logger.info("\n" + "=" * 50)
-        logger.info("COMPRESSION SESSION SUMMARY")
-        logger.info("=" * 50)
-        logger.info(f"Total files processed: {len(pdf_files)}")
-        logger.info(f"Successful compressions: {successful_compressions}")
-        logger.info(f"Failed compressions: {failed_compressions}")
-
-        if successful_compressions > 0:
-            overall_compression = (
-                                          1 - total_compressed_size / total_original_size) * 100 if total_original_size > 0 else 0
-            logger.info(f"Total original size: {total_original_size:.2f} MB")
-            logger.info(f"Total compressed size: {total_compressed_size:.2f} MB")
-            logger.info(f"Overall compression ratio: {overall_compression:.1f}%")
-
-        # Show completion message
-        if replace_originals:
-            if create_backup:
-                message = f"Compression completed!\n\nProcessed: {successful_compressions}/{len(pdf_files)} files"
-                if backup_base_dir and successful_compressions > 0:
-                    message += f"\nOriginal files backed up to: {backup_base_dir}"
-            else:
-                message = f"Compression completed!\n\nProcessed: {successful_compressions}/{len(pdf_files)} files\nOriginal files replaced without backup"
-        else:
-            message = f"Compression completed!\n\nProcessed: {successful_compressions}/{len(pdf_files)} files\nCompressed files saved to: {output_base_dir}"
-
-        messagebox.showinfo("Compression Complete", message)
-        logger.info("PDF compression session completed")
-
-    except Exception as e:
-        error_msg = f"Unexpected error during batch compression: {e}"
-        logger.error(error_msg)
-        messagebox.showerror("Unexpected Error", error_msg)
-        raise
-
-
-def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="ebook", replace_originals=False,
-                                   recursive=True):
-    """Legacy function - compress all PDFs in a directory with basic settings"""
-    compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi, quality, replace_originals, recursive,
-                                                      True)
-    import os
-
-
+import os
 import sys
 import subprocess
 import logging
@@ -191,14 +22,27 @@ except ImportError:
         EXCEL_SUPPORT = False
 
 
-def setup_logging(log_dir):
-    """Setup logging to both console and file"""
-    log_dir = Path(log_dir)
+def setup_logging():
+    """Setup logging to both console and file in the application directory"""
+    # Get the directory where the script/executable is located
+    if getattr(sys, 'frozen', False):
+        # If running as compiled executable
+        app_dir = Path(sys.executable).parent
+    else:
+        # If running as script
+        app_dir = Path(__file__).parent
+
+    # Create logs directory in the application directory
+    log_dir = app_dir / "logs"
     log_dir.mkdir(exist_ok=True)
 
     # Create log filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"pdf_compression_{timestamp}.log"
+
+    # Remove any existing handlers to avoid duplicates
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
 
     # Configure logging
     logging.basicConfig(
@@ -212,6 +56,7 @@ def setup_logging(log_dir):
 
     logger = logging.getLogger(__name__)
     logger.info(f"Logging initialized. Log file: {log_file}")
+    logger.info(f"Application directory: {app_dir}")
     return logger
 
 
@@ -387,29 +232,32 @@ def get_relative_path(file_path, base_path):
         return Path(file_path).name
 
 
-def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="ebook", replace_originals=False,
-                                   recursive=True):
-    """Compress all PDFs in a directory and optionally its subdirectories"""
+def compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi=150, quality="ebook",
+                                                      replace_originals=False, recursive=True, create_backup=True,
+                                                      min_file_size_mb=1.0, logger=None):
+    """Compress all PDFs in a directory with backup option control and minimum file size filter"""
     directory = Path(directory)
 
-    # Setup logging
-    log_dir = directory / "compression_logs"
-    logger = setup_logging(log_dir)
+    # Use existing logger if provided, otherwise get default logger
+    if logger is None:
+        logger = logging.getLogger(__name__)
 
     try:
         logger.info("=" * 50)
-        logger.info("PDF COMPRESSION SESSION STARTED")
+        logger.info(f"PROCESSING DIRECTORY: {directory}")
         logger.info("=" * 50)
         logger.info(f"Source directory: {directory}")
         logger.info(f"Recursive processing: {recursive}")
         logger.info(f"Color Image DPI setting: {color_image_dpi}")
         logger.info(f"Quality setting: {quality}")
         logger.info(f"Replace originals: {replace_originals}")
+        logger.info(f"Create backup: {create_backup}")
+        logger.info(f"Minimum file size: {min_file_size_mb:.1f} MB")
 
         # Create output directory
         if replace_originals:
             output_base_dir = directory / "temp_compressed"
-            backup_base_dir = directory / "original_backups"
+            backup_base_dir = directory / "original_backups" if create_backup else None
         else:
             output_base_dir = directory.parent / f"{directory.name}_compressed_pdfs"
             backup_base_dir = None
@@ -427,8 +275,139 @@ def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="eboo
         if not pdf_files:
             message = f"No PDF files found in the selected folder{' and its subdirectories' if recursive else ''}."
             logger.warning(message)
-            messagebox.showinfo("Info", message)
-            return
+            return {'successful': 0, 'failed': 0, 'skipped': 0, 'message': message}
+
+        logger.info(f"Found {len(pdf_files)} PDF files to process")
+
+        # Filter files by size
+        files_to_process = []
+        skipped_files = []
+
+        for pdf_file in pdf_files:
+            try:
+                file_size_mb = get_file_size(str(pdf_file))
+                if file_size_mb >= min_file_size_mb:
+                    files_to_process.append(pdf_file)
+                else:
+                    skipped_files.append((pdf_file, file_size_mb))
+                    rel_path = get_relative_path(pdf_file, directory)
+                    logger.info(
+                        f"⏭️ Skipping small file: {rel_path} ({file_size_mb:.2f} MB < {min_file_size_mb:.1f} MB)")
+            except Exception as e:
+                logger.warning(f"Could not check size of {pdf_file}: {e}")
+                files_to_process.append(pdf_file)  # Process it anyway if we can't check size
+
+        logger.info(f"Files to process: {len(files_to_process)}")
+        logger.info(f"Files skipped (too small): {len(skipped_files)}")
+
+        if not files_to_process:
+            message = f"No PDF files meet the minimum size requirement ({min_file_size_mb:.1f} MB)."
+            logger.warning(message)
+            return {'successful': 0, 'failed': 0, 'skipped': len(skipped_files), 'message': message}
+
+        # Group files by directory for better logging
+        files_by_dir = {}
+        for pdf_file in files_to_process:
+            parent_dir = pdf_file.parent
+            if parent_dir not in files_by_dir:
+                files_by_dir[parent_dir] = []
+            files_by_dir[parent_dir].append(pdf_file)
+
+        logger.info(f"Files to process distributed across {len(files_by_dir)} directories:")
+        for dir_path, files in files_by_dir.items():
+            rel_dir = get_relative_path(dir_path, directory)
+            logger.info(f"  {rel_dir}: {len(files)} files")
+
+        # Process each PDF
+        successful_compressions = 0
+        failed_compressions = 0
+        total_original_size = 0
+        total_compressed_size = 0
+
+        for i, pdf in enumerate(files_to_process, 1):
+            try:
+                # Get relative path for better logging
+                rel_path = get_relative_path(pdf, directory)
+                logger.info(f"\n--- Processing file {i}/{len(files_to_process)}: {rel_path} ---")
+
+                # Create output path maintaining directory structure
+                if replace_originals:
+                    # For replacement, maintain the same relative structure in temp directory
+                    relative_pdf_path = pdf.relative_to(directory)
+                    output_path = output_base_dir / relative_pdf_path
+                    backup_dir = backup_base_dir / relative_pdf_path.parent if backup_base_dir else None
+                else:
+                    # For separate output, maintain directory structure
+                    relative_pdf_path = pdf.relative_to(directory)
+                    output_path = output_base_dir / relative_pdf_path
+                    backup_dir = None
+
+                # Create output directory if it doesn't exist
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                if backup_dir:
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+
+                # Compress PDF
+                result = compress_pdf(str(pdf), str(output_path), color_image_dpi, quality, logger)
+
+                if result['success']:
+                    total_original_size += result['original_size']
+                    total_compressed_size += result['compressed_size']
+
+                    # Replace original if requested
+                    if replace_originals:
+                        try:
+                            if create_backup:
+                                replace_original_file(pdf, output_path, backup_dir, logger)
+                            else:
+                                # Replace without backup
+                                shutil.move(str(output_path), str(pdf))
+                                logger.info(f"Original file replaced without backup: {pdf}")
+                        except Exception as e:
+                            logger.error(f"Failed to replace original file: {e}")
+                            failed_compressions += 1
+                            continue
+
+                    successful_compressions += 1
+                    logger.info(f"✓ Successfully processed: {rel_path}")
+
+            except Exception as e:
+                failed_compressions += 1
+                rel_path = get_relative_path(pdf, directory)
+                logger.error(f"✗ Failed to process {rel_path}: {e}")
+
+        # Clean up temp directory if replacing originals
+        if replace_originals and output_base_dir.exists():
+            try:
+                shutil.rmtree(output_base_dir)
+                logger.info("Temporary directory cleaned up")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary directory: {e}")
+
+        # Summary for this directory
+        logger.info(f"\n--- DIRECTORY SUMMARY: {directory.name} ---")
+        logger.info(f"Total files found: {len(pdf_files)}")
+        logger.info(f"Files processed: {len(files_to_process)}")
+        logger.info(f"Files skipped (too small): {len(skipped_files)}")
+        logger.info(f"Successful compressions: {successful_compressions}")
+        logger.info(f"Failed compressions: {failed_compressions}")
+
+        if successful_compressions > 0:
+            overall_compression = (
+                                          1 - total_compressed_size / total_original_size) * 100 if total_original_size > 0 else 0
+            logger.info(f"Total original size: {total_original_size:.2f} MB")
+            logger.info(f"Total compressed size: {total_compressed_size:.2f} MB")
+            logger.info(f"Overall compression ratio: {overall_compression:.1f}%")
+
+        return {
+            'successful': successful_compressions,
+            'failed': failed_compressions,
+            'skipped': len(skipped_files),
+            'total_original_size': total_original_size,
+            'total_compressed_size': total_compressed_size
+        }
+
+
 
         logger.info(f"Found {len(pdf_files)} PDF files to compress")
 
@@ -462,7 +441,7 @@ def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="eboo
                     # For replacement, maintain the same relative structure in temp directory
                     relative_pdf_path = pdf.relative_to(directory)
                     output_path = output_base_dir / relative_pdf_path
-                    backup_dir = backup_base_dir / relative_pdf_path.parent
+                    backup_dir = backup_base_dir / relative_pdf_path.parent if backup_base_dir else None
                 else:
                     # For separate output, maintain directory structure
                     relative_pdf_path = pdf.relative_to(directory)
@@ -484,7 +463,12 @@ def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="eboo
                     # Replace original if requested
                     if replace_originals:
                         try:
-                            replace_original_file(pdf, output_path, backup_dir, logger)
+                            if create_backup:
+                                replace_original_file(pdf, output_path, backup_dir, logger)
+                            else:
+                                # Replace without backup
+                                shutil.move(str(output_path), str(pdf))
+                                logger.info(f"Original file replaced without backup: {pdf}")
                         except Exception as e:
                             logger.error(f"Failed to replace original file: {e}")
                             failed_compressions += 1
@@ -497,7 +481,6 @@ def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="eboo
                 failed_compressions += 1
                 rel_path = get_relative_path(pdf, directory)
                 logger.error(f"✗ Failed to process {rel_path}: {e}")
-                messagebox.showerror("Error", f"Failed to compress '{rel_path}': {e}")
 
         # Clean up temp directory if replacing originals
         if replace_originals and output_base_dir.exists():
@@ -507,10 +490,8 @@ def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="eboo
             except Exception as e:
                 logger.warning(f"Failed to clean up temporary directory: {e}")
 
-        # Summary
-        logger.info("\n" + "=" * 50)
-        logger.info("COMPRESSION SESSION SUMMARY")
-        logger.info("=" * 50)
+        # Summary for this directory
+        logger.info(f"\n--- DIRECTORY SUMMARY: {directory.name} ---")
         logger.info(f"Total files processed: {len(pdf_files)}")
         logger.info(f"Successful compressions: {successful_compressions}")
         logger.info(f"Failed compressions: {failed_compressions}")
@@ -522,22 +503,44 @@ def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="eboo
             logger.info(f"Total compressed size: {total_compressed_size:.2f} MB")
             logger.info(f"Overall compression ratio: {overall_compression:.1f}%")
 
-        # Show completion message
-        if replace_originals:
-            message = f"Compression completed!\n\nProcessed: {successful_compressions}/{len(pdf_files)} files"
-            if backup_base_dir and successful_compressions > 0:
-                message += f"\nOriginal files backed up to: {backup_base_dir}"
-        else:
-            message = f"Compression completed!\n\nProcessed: {successful_compressions}/{len(pdf_files)} files\nCompressed files saved to: {output_base_dir}"
-
-        messagebox.showinfo("Compression Complete", message)
-        logger.info("PDF compression session completed")
+        return {
+            'successful': successful_compressions,
+            'failed': failed_compressions,
+            'total_original_size': total_original_size,
+            'total_compressed_size': total_compressed_size
+        }
 
     except Exception as e:
-        error_msg = f"Unexpected error during batch compression: {e}"
+        error_msg = f"Unexpected error during batch compression in {directory}: {e}"
         logger.error(error_msg)
-        messagebox.showerror("Unexpected Error", error_msg)
         raise
+
+
+def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="ebook", replace_originals=False,
+                                   recursive=True):
+    """Legacy function - compress all PDFs in a directory with basic settings"""
+    logger = setup_logging()
+    result = compress_all_pdfs_in_directory_with_backup_option(
+        directory, color_image_dpi, quality, replace_originals, recursive, True, 1.0, logger
+    )
+
+    # Show completion message
+    if replace_originals:
+        message = f"Compression completed!\n\nProcessed: {result['successful']}/{result['successful'] + result['failed']} files"
+        if result['skipped'] > 0:
+            message += f"\nSkipped (too small): {result['skipped']} files"
+        backup_base_dir = Path(directory) / "original_backups"
+        if backup_base_dir.exists() and result['successful'] > 0:
+            message += f"\nOriginal files backed up to: {backup_base_dir}"
+    else:
+        output_base_dir = Path(directory).parent / f"{Path(directory).name}_compressed_pdfs"
+        message = f"Compression completed!\n\nProcessed: {result['successful']}/{result['successful'] + result['failed']} files"
+        if result['skipped'] > 0:
+            message += f"\nSkipped (too small): {result['skipped']} files"
+        message += f"\nCompressed files saved to: {output_base_dir}"
+
+    messagebox.showinfo("Compression Complete", message)
+    logger.info("PDF compression session completed")
 
 
 class PDFCompressorGUI:
@@ -546,20 +549,22 @@ class PDFCompressorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("PDF Compressor - Advanced Settings")
-        self.root.geometry("750x700")  # Adjusted width and height for scrollable interface
+        self.root.geometry("750x700")
         self.root.resizable(True, True)
-
-        # Set minimum window size to ensure usability
         self.root.minsize(600, 500)
 
+        # Initialize logger at startup
+        self.logger = setup_logging()
+
         # Variables for settings
-        self.selected_folders = []  # List to store multiple folders
+        self.selected_folders = []
         self.color_image_dpi = tk.IntVar(value=150)
         self.quality = tk.StringVar(value="screen")
         self.recursive = tk.BooleanVar(value=True)
-        self.replace_mode = tk.StringVar(value="no_replace")  # no_replace, replace_with_backup, replace_without_backup
+        self.replace_mode = tk.StringVar(value="no_replace")
+        self.min_file_size = tk.DoubleVar(value=1.0)  # Minimum file size in MB
 
-        # Progress tracking variables - THIS WAS MISSING
+        # Progress tracking variables
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_details = tk.StringVar(value="")
 
@@ -681,6 +686,37 @@ class PDFCompressorGUI:
         tk.Button(dpi_presets_frame, text="High (300)",
                   command=lambda: self.set_dpi(300), bg="lightgreen").pack(side=tk.LEFT, padx=2)
 
+        # Minimum file size setting
+        size_frame = tk.Frame(settings_frame)
+        size_frame.pack(fill=tk.X, pady=5)
+
+        tk.Label(size_frame, text="Skip files smaller than:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+
+        size_control_frame = tk.Frame(size_frame)
+        size_control_frame.pack(fill=tk.X, pady=2)
+
+        size_scale = tk.Scale(size_control_frame, from_=0.1, to=10.0,
+                              variable=self.min_file_size, orient=tk.HORIZONTAL,
+                              length=300, resolution=0.1, command=self.update_size_label)
+        size_scale.pack(side=tk.LEFT)
+
+        self.size_label = tk.Label(size_control_frame, text="1.0 MB",
+                                   font=("Arial", 10), fg="darkgreen")
+        self.size_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Size presets
+        size_presets_frame = tk.Frame(size_frame)
+        size_presets_frame.pack(fill=tk.X, pady=5)
+
+        tk.Button(size_presets_frame, text="Skip None (0.1 MB)",
+                  command=lambda: self.set_min_size(0.1), bg="lightcoral").pack(side=tk.LEFT, padx=2)
+        tk.Button(size_presets_frame, text="Small Files (1 MB)",
+                  command=lambda: self.set_min_size(1.0), bg="lightyellow").pack(side=tk.LEFT, padx=2)
+        tk.Button(size_presets_frame, text="Medium Files (5 MB)",
+                  command=lambda: self.set_min_size(5.0), bg="lightgreen").pack(side=tk.LEFT, padx=2)
+        tk.Button(size_presets_frame, text="Large Files (10 MB)",
+                  command=lambda: self.set_min_size(10.0), bg="lightblue").pack(side=tk.LEFT, padx=2)
+
         # Processing options frame
         options_frame = tk.LabelFrame(main_frame, text="Processing Options", padx=10, pady=10)
         options_frame.pack(fill=tk.X, pady=10)
@@ -703,7 +739,7 @@ class PDFCompressorGUI:
             tk.Radiobutton(options_frame, text=text, variable=self.replace_mode,
                            value=value, font=("Arial", 9)).pack(anchor=tk.W, pady=1)
 
-        # Progress frame - THIS WAS MISSING
+        # Progress frame
         progress_frame = tk.LabelFrame(main_frame, text="Progress", padx=10, pady=10)
         progress_frame.pack(fill=tk.X, pady=10)
 
@@ -747,23 +783,36 @@ class PDFCompressorGUI:
         info_frame = tk.LabelFrame(main_frame, text="Information", padx=10, pady=5)
         info_frame.pack(fill=tk.X, pady=5)
 
-        info_text = tk.Text(info_frame, height=3, wrap=tk.WORD, font=("Arial", 9))
+        info_text = tk.Text(info_frame, height=4, wrap=tk.WORD, font=("Arial", 9))
         info_text.pack(fill=tk.X)
         info_text.insert(tk.END,
                          "• Double-click on folder list to remove a folder\n"
                          "• Use Color Image DPI to control compression level (lower = smaller files)\n"
+                         "• Set minimum file size to skip small files that don't need compression\n"
                          "• Screen quality preset is used for all compressions (optimized for web/email)\n"
-                         "• Import from Excel: First column should contain folder paths")
+                         "• Import from Excel: First column should contain folder paths\n"
+                         "• All logs are saved in the 'logs' folder next to the application")
         info_text.config(state=tk.DISABLED)
+
     def update_dpi_label(self, value):
         """Update DPI label when scale changes"""
         dpi_val = int(float(value))
         self.dpi_label.config(text=f"{dpi_val} DPI")
 
+    def update_size_label(self, value):
+        """Update size label when scale changes"""
+        size_val = float(value)
+        self.size_label.config(text=f"{size_val:.1f} MB")
+
     def set_dpi(self, dpi_value):
         """Set DPI to specific value"""
         self.color_image_dpi.set(dpi_value)
         self.update_dpi_label(dpi_value)
+
+    def set_min_size(self, size_value):
+        """Set minimum file size to specific value"""
+        self.min_file_size.set(size_value)
+        self.update_size_label(size_value)
 
     def add_folder(self):
         """Add a folder to the selection list"""
@@ -908,10 +957,12 @@ class PDFCompressorGUI:
         self.quality.set("screen")
         self.recursive.set(True)
         self.replace_mode.set("no_replace")
+        self.min_file_size.set(1.0)
         self.status_text.set("Settings reset to defaults")
         self.progress_details.set("")
         self.progress_var.set(0)
         self.update_dpi_label(150)
+        self.update_size_label(1.0)
 
     def start_compression(self):
         """Start the compression process"""
@@ -930,6 +981,7 @@ class PDFCompressorGUI:
         quality = self.quality.get()
         recursive = self.recursive.get()
         replace_mode = self.replace_mode.get()
+        min_file_size = self.min_file_size.get()
 
         # Convert replace mode to boolean values
         replace_originals = replace_mode in ["replace_with_backup", "replace_without_backup"]
@@ -942,6 +994,7 @@ Selected Folders: {len(self.selected_folders)} folder(s)
 {chr(10).join([f"  • {Path(f).name}" for f in self.selected_folders])}
 
 Color Image DPI: {color_image_dpi}
+Minimum file size: {min_file_size:.1f} MB
 Process subdirectories: {'Yes' if recursive else 'No'}
 File handling: {
         'Keep originals (create new files)' if replace_mode == 'no_replace'
@@ -963,6 +1016,14 @@ Do you want to start compression with these settings?"""
         self.root.update()
 
         try:
+            self.logger.info("\n" + "=" * 60)
+            self.logger.info("BULK PDF COMPRESSION SESSION STARTED")
+            self.logger.info("=" * 60)
+            self.logger.info(f"Total folders to process: {len(self.selected_folders)}")
+            self.logger.info(f"Settings: DPI={color_image_dpi}, Quality={quality}, Recursive={recursive}")
+            self.logger.info(f"Minimum file size: {min_file_size:.1f} MB")
+            self.logger.info(f"Replace mode: {replace_mode}")
+
             print("Starting PDF compression...")
             print("Check the console and log files for detailed progress...")
 
@@ -970,6 +1031,9 @@ Do you want to start compression with these settings?"""
             total_processed = 0
             total_successful = 0
             total_failed = 0
+            total_skipped = 0
+            total_original_size = 0
+            total_compressed_size = 0
 
             for i, folder in enumerate(self.selected_folders, 1):
                 folder_progress = (i - 1) / len(self.selected_folders) * 100
@@ -981,18 +1045,38 @@ Do you want to start compression with these settings?"""
 
                 # Process folder with progress callback
                 result = self.compress_folder_with_progress(
-                    folder, color_image_dpi, quality, replace_originals, recursive, create_backup, i,
+                    folder, color_image_dpi, quality, replace_originals, recursive, create_backup, min_file_size, i,
                     len(self.selected_folders)
                 )
 
                 total_processed += 1
                 total_successful += result.get('successful', 0)
                 total_failed += result.get('failed', 0)
+                total_skipped += result.get('skipped', 0)
+                total_original_size += result.get('total_original_size', 0)
+                total_compressed_size += result.get('total_compressed_size', 0)
 
             # Final update
             self.progress_var.set(100)
             self.status_text.set(f"Compression completed! Processed {total_processed} folder(s)")
-            self.progress_details.set(f"Total: {total_successful} successful, {total_failed} failed")
+            self.progress_details.set(
+                f"Total: {total_successful} successful, {total_failed} failed, {total_skipped} skipped")
+
+            # Final session summary
+            self.logger.info("\n" + "=" * 60)
+            self.logger.info("BULK COMPRESSION SESSION SUMMARY")
+            self.logger.info("=" * 60)
+            self.logger.info(f"Folders processed: {total_processed}")
+            self.logger.info(f"Total files successful: {total_successful}")
+            self.logger.info(f"Total files failed: {total_failed}")
+            self.logger.info(f"Total files skipped: {total_skipped}")
+            if total_successful > 0:
+                overall_compression = (
+                                                  1 - total_compressed_size / total_original_size) * 100 if total_original_size > 0 else 0
+                self.logger.info(f"Total original size: {total_original_size:.2f} MB")
+                self.logger.info(f"Total compressed size: {total_compressed_size:.2f} MB")
+                self.logger.info(f"Overall compression ratio: {overall_compression:.1f}%")
+            self.logger.info("Session completed successfully")
 
             # Show final summary
             summary_msg = f"Compression completed!\n\n"
@@ -1000,112 +1084,55 @@ Do you want to start compression with these settings?"""
             summary_msg += f"Files successful: {total_successful}\n"
             if total_failed > 0:
                 summary_msg += f"Files failed: {total_failed}\n"
-            summary_msg += f"\nCheck log files for detailed information."
+            if total_skipped > 0:
+                summary_msg += f"Files skipped (too small): {total_skipped}\n"
+            if total_successful > 0:
+                overall_compression = (
+                                                  1 - total_compressed_size / total_original_size) * 100 if total_original_size > 0 else 0
+                summary_msg += f"Total space saved: {overall_compression:.1f}%\n"
+            summary_msg += f"\nDetailed logs saved in the 'logs' folder."
 
             messagebox.showinfo("Compression Complete", summary_msg)
 
         except Exception as e:
             error_msg = f"Compression failed: {str(e)}"
-            logging.error(f"Application error: {e}")
+            self.logger.error(f"Application error: {e}")
             messagebox.showerror("Compression Error", error_msg)
             self.status_text.set("Compression failed!")
             self.progress_details.set("Error occurred")
 
     def compress_folder_with_progress(self, folder, color_image_dpi, quality, replace_originals, recursive,
-                                      create_backup, folder_index, total_folders):
+                                      create_backup, min_file_size, folder_index, total_folders):
         """Compress folder with progress updates"""
         try:
             # Get all PDF files first to calculate progress
             pdf_files = find_all_pdfs(folder, recursive)
             if not pdf_files:
                 self.progress_details.set(f"No PDF files found in {Path(folder).name}")
-                return {'successful': 0, 'failed': 0}
+                self.logger.warning(f"No PDF files found in {folder}")
+                return {'successful': 0, 'failed': 0, 'skipped': 0, 'total_original_size': 0,
+                        'total_compressed_size': 0}
 
-            successful = 0
-            failed = 0
+            # Use the main logger for all operations
+            result = compress_all_pdfs_in_directory_with_backup_option(
+                folder, color_image_dpi, quality, replace_originals, recursive, create_backup, min_file_size,
+                self.logger
+            )
 
-            # Setup logging for this folder
-            directory = Path(folder)
-            log_dir = directory / "compression_logs"
-            logger = setup_logging(log_dir)
-
-            logger.info(f"Processing folder: {folder}")
-            logger.info(f"Found {len(pdf_files)} PDF files")
-
-            # Create output directories
-            if replace_originals:
-                output_base_dir = directory / "temp_compressed"
-                backup_base_dir = directory / "original_backups" if create_backup else None
-            else:
-                output_base_dir = directory.parent / f"{directory.name}_compressed_pdfs"
-                backup_base_dir = None
-
-            output_base_dir.mkdir(exist_ok=True)
-            if backup_base_dir:
-                backup_base_dir.mkdir(exist_ok=True)
-
-            # Process each PDF
+            # Update progress for individual files within this folder
             for i, pdf_file in enumerate(pdf_files, 1):
-                try:
-                    # Calculate overall progress
-                    folder_progress = ((folder_index - 1) + (i / len(pdf_files))) / total_folders * 100
-                    self.progress_var.set(folder_progress)
+                folder_progress = ((folder_index - 1) + (i / len(pdf_files))) / total_folders * 100
+                self.progress_var.set(folder_progress)
 
-                    rel_path = get_relative_path(pdf_file, directory)
-                    self.progress_details.set(f"Processing: {rel_path} ({i}/{len(pdf_files)})")
-                    self.root.update()
+                rel_path = get_relative_path(pdf_file, Path(folder))
+                self.progress_details.set(f"Processing: {rel_path} ({i}/{len(pdf_files)})")
+                self.root.update()
 
-                    # Create output path
-                    if replace_originals:
-                        relative_pdf_path = pdf_file.relative_to(directory)
-                        output_path = output_base_dir / relative_pdf_path
-                        backup_dir = backup_base_dir / relative_pdf_path.parent if backup_base_dir else None
-                    else:
-                        relative_pdf_path = pdf_file.relative_to(directory)
-                        output_path = output_base_dir / relative_pdf_path
-                        backup_dir = None
-
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    if backup_dir:
-                        backup_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Compress PDF
-                    result = compress_pdf(str(pdf_file), str(output_path), color_image_dpi, quality, logger)
-
-                    if result['success']:
-                        # Replace original if requested
-                        if replace_originals:
-                            if create_backup:
-                                replace_original_file(pdf_file, output_path, backup_dir, logger)
-                            else:
-                                shutil.move(str(output_path), str(pdf_file))
-                                logger.info(f"Original file replaced without backup: {pdf_file}")
-
-                        successful += 1
-                        logger.info(f"✓ Successfully processed: {rel_path}")
-                    else:
-                        failed += 1
-                        logger.error(f"✗ Failed to process: {rel_path}")
-
-                except Exception as e:
-                    failed += 1
-                    rel_path = get_relative_path(pdf_file, directory)
-                    logger.error(f"✗ Failed to process {rel_path}: {e}")
-
-            # Clean up temp directory if replacing originals
-            if replace_originals and output_base_dir.exists():
-                try:
-                    shutil.rmtree(output_base_dir)
-                    logger.info("Temporary directory cleaned up")
-                except Exception as e:
-                    logger.warning(f"Failed to clean up temporary directory: {e}")
-
-            logger.info(f"Folder processing complete: {successful} successful, {failed} failed")
-            return {'successful': successful, 'failed': failed}
+            return result
 
         except Exception as e:
-            logging.error(f"Error processing folder {folder}: {e}")
-            return {'successful': 0, 'failed': 1}
+            self.logger.error(f"Error processing folder {folder}: {e}")
+            return {'successful': 0, 'failed': 1, 'skipped': 0, 'total_original_size': 0, 'total_compressed_size': 0}
 
 
 def main():
