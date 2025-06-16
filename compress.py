@@ -7,6 +7,11 @@ from pathlib import Path
 from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+import time
+import multiprocessing
 
 # Try to import Excel libraries
 try:
@@ -232,10 +237,53 @@ def get_relative_path(file_path, base_path):
         return Path(file_path).name
 
 
-def compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi=150, quality="ebook",
-                                                      replace_originals=False, recursive=True, create_backup=True,
-                                                      min_file_size_mb=1.0, logger=None):
-    """Compress all PDFs in a directory with backup option control and minimum file size filter"""
+def compress_single_pdf_task(args):
+    """Worker function for processing a single PDF file in thread pool"""
+    pdf_path, output_path, backup_dir, color_image_dpi, quality, replace_originals, create_backup, logger, thread_id = args
+
+    try:
+        # Log which thread is processing this file for debugging
+        rel_path = get_relative_path(pdf_path, pdf_path.parent.parent if pdf_path.parent.parent else pdf_path.parent)
+        logger.info(f"🧵 Thread-{thread_id}: Starting {rel_path}")
+
+        # Compress PDF
+        result = compress_pdf(str(pdf_path), str(output_path), color_image_dpi, quality, logger)
+
+        if result['success']:
+            # Replace original if requested
+            if replace_originals:
+                try:
+                    if create_backup:
+                        replace_original_file(pdf_path, output_path, backup_dir, logger)
+                    else:
+                        # Replace without backup
+                        shutil.move(str(output_path), str(pdf_path))
+                        logger.info(f"Original file replaced without backup: {pdf_path}")
+                except Exception as e:
+                    logger.error(f"Failed to replace original file: {e}")
+                    return {'status': 'failed', 'pdf_path': pdf_path, 'error': str(e), 'thread_id': thread_id}
+
+            logger.info(f"🧵 Thread-{thread_id}: Completed {rel_path}")
+            return {
+                'status': 'success',
+                'pdf_path': pdf_path,
+                'original_size': result['original_size'],
+                'compressed_size': result['compressed_size'],
+                'compression_ratio': result['compression_ratio'],
+                'thread_id': thread_id
+            }
+        else:
+            return {'status': 'failed', 'pdf_path': pdf_path, 'error': 'Compression failed', 'thread_id': thread_id}
+
+    except Exception as e:
+        logger.error(f"🧵 Thread-{thread_id}: Error processing {pdf_path}: {e}")
+        return {'status': 'failed', 'pdf_path': pdf_path, 'error': str(e), 'thread_id': thread_id}
+
+
+def compress_all_pdfs_in_directory_threaded(directory, color_image_dpi=150, quality="ebook",
+                                            replace_originals=False, recursive=True, create_backup=True,
+                                            min_file_size_mb=1.0, max_threads=4, logger=None):
+    """Compress all PDFs in a directory using multithreading"""
     directory = Path(directory)
 
     # Use existing logger if provided, otherwise get default logger
@@ -244,7 +292,7 @@ def compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi
 
     try:
         logger.info("=" * 50)
-        logger.info(f"PROCESSING DIRECTORY: {directory}")
+        logger.info(f"PROCESSING DIRECTORY WITH THREADING: {directory}")
         logger.info("=" * 50)
         logger.info(f"Source directory: {directory}")
         logger.info(f"Recursive processing: {recursive}")
@@ -253,6 +301,7 @@ def compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi
         logger.info(f"Replace originals: {replace_originals}")
         logger.info(f"Create backup: {create_backup}")
         logger.info(f"Minimum file size: {min_file_size_mb:.1f} MB")
+        logger.info(f"Max threads: {max_threads}")
 
         # Create output directory
         if replace_originals:
@@ -305,76 +354,86 @@ def compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi
             logger.warning(message)
             return {'successful': 0, 'failed': 0, 'skipped': len(skipped_files), 'message': message}
 
-        # Group files by directory for better logging
-        files_by_dir = {}
-        for pdf_file in files_to_process:
-            parent_dir = pdf_file.parent
-            if parent_dir not in files_by_dir:
-                files_by_dir[parent_dir] = []
-            files_by_dir[parent_dir].append(pdf_file)
+        # Prepare tasks for thread pool
+        tasks = []
+        for i, pdf_file in enumerate(files_to_process):
+            # Create output path maintaining directory structure
+            if replace_originals:
+                relative_pdf_path = pdf_file.relative_to(directory)
+                output_path = output_base_dir / relative_pdf_path
+                backup_dir = backup_base_dir / relative_pdf_path.parent if backup_base_dir else None
+            else:
+                relative_pdf_path = pdf_file.relative_to(directory)
+                output_path = output_base_dir / relative_pdf_path
+                backup_dir = None
 
-        logger.info(f"Files to process distributed across {len(files_by_dir)} directories:")
-        for dir_path, files in files_by_dir.items():
-            rel_dir = get_relative_path(dir_path, directory)
-            logger.info(f"  {rel_dir}: {len(files)} files")
+            # Create output directory if it doesn't exist
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if backup_dir:
+                backup_dir.mkdir(parents=True, exist_ok=True)
 
-        # Process each PDF
+            # Create task tuple with thread ID for tracking
+            thread_id = (i % max_threads) + 1  # Assign thread IDs cyclically
+            task = (
+            pdf_file, output_path, backup_dir, color_image_dpi, quality, replace_originals, create_backup, logger,
+            thread_id)
+            tasks.append(task)
+
+        # Process files using thread pool
         successful_compressions = 0
         failed_compressions = 0
         total_original_size = 0
         total_compressed_size = 0
 
-        for i, pdf in enumerate(files_to_process, 1):
-            try:
-                # Get relative path for better logging
-                rel_path = get_relative_path(pdf, directory)
-                logger.info(f"\n--- Processing file {i}/{len(files_to_process)}: {rel_path} ---")
+        logger.info(f"Starting parallel processing with {max_threads} threads...")
+        logger.info(f"Tasks distribution: {len(tasks)} files across {max_threads} threads")
+        start_time = time.time()
 
-                # Create output path maintaining directory structure
-                if replace_originals:
-                    # For replacement, maintain the same relative structure in temp directory
-                    relative_pdf_path = pdf.relative_to(directory)
-                    output_path = output_base_dir / relative_pdf_path
-                    backup_dir = backup_base_dir / relative_pdf_path.parent if backup_base_dir else None
-                else:
-                    # For separate output, maintain directory structure
-                    relative_pdf_path = pdf.relative_to(directory)
-                    output_path = output_base_dir / relative_pdf_path
-                    backup_dir = None
+        # Track thread usage
+        thread_usage = {}
 
-                # Create output directory if it doesn't exist
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                if backup_dir:
-                    backup_dir.mkdir(parents=True, exist_ok=True)
+        with ThreadPoolExecutor(max_workers=max_threads, thread_name_prefix="PDFCompressor") as executor:
+            # Submit all tasks
+            future_to_task = {executor.submit(compress_single_pdf_task, task): task for task in tasks}
 
-                # Compress PDF
-                result = compress_pdf(str(pdf), str(output_path), color_image_dpi, quality, logger)
+            # Process completed tasks
+            for i, future in enumerate(as_completed(future_to_task), 1):
+                task = future_to_task[future]
+                pdf_file = task[0]
+                rel_path = get_relative_path(pdf_file, directory)
 
-                if result['success']:
-                    total_original_size += result['original_size']
-                    total_compressed_size += result['compressed_size']
+                try:
+                    result = future.result()
+                    thread_id = result.get('thread_id', 'Unknown')
 
-                    # Replace original if requested
-                    if replace_originals:
-                        try:
-                            if create_backup:
-                                replace_original_file(pdf, output_path, backup_dir, logger)
-                            else:
-                                # Replace without backup
-                                shutil.move(str(output_path), str(pdf))
-                                logger.info(f"Original file replaced without backup: {pdf}")
-                        except Exception as e:
-                            logger.error(f"Failed to replace original file: {e}")
-                            failed_compressions += 1
-                            continue
+                    # Track thread usage
+                    if thread_id not in thread_usage:
+                        thread_usage[thread_id] = 0
+                    thread_usage[thread_id] += 1
 
-                    successful_compressions += 1
-                    logger.info(f"✓ Successfully processed: {rel_path}")
+                    if result['status'] == 'success':
+                        successful_compressions += 1
+                        total_original_size += result['original_size']
+                        total_compressed_size += result['compressed_size']
+                        logger.info(
+                            f"✓ [{i}/{len(tasks)}] T{thread_id}: {rel_path} ({result['compression_ratio']:.1f}% reduction)")
+                    else:
+                        failed_compressions += 1
+                        logger.error(
+                            f"✗ [{i}/{len(tasks)}] T{thread_id}: {rel_path} - {result.get('error', 'Unknown error')}")
 
-            except Exception as e:
-                failed_compressions += 1
-                rel_path = get_relative_path(pdf, directory)
-                logger.error(f"✗ Failed to process {rel_path}: {e}")
+                except Exception as e:
+                    failed_compressions += 1
+                    logger.error(f"✗ [{i}/{len(tasks)}] Exception processing {rel_path}: {e}")
+
+        processing_time = time.time() - start_time
+
+        # Log thread usage statistics
+        logger.info(f"Thread usage statistics:")
+        for thread_id, count in sorted(thread_usage.items()):
+            logger.info(f"  Thread-{thread_id}: processed {count} files")
+
+        logger.info(f"Parallel processing completed in {processing_time:.1f} seconds")
 
         # Clean up temp directory if replacing originals
         if replace_originals and output_base_dir.exists():
@@ -385,7 +444,8 @@ def compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi
                 logger.warning(f"Failed to clean up temporary directory: {e}")
 
         # Summary for this directory
-        logger.info(f"\n--- DIRECTORY SUMMARY: {directory.name} ---")
+        logger.info(f"\n--- THREADED DIRECTORY SUMMARY: {directory.name} ---")
+        logger.info(f"Processing time: {processing_time:.1f} seconds")
         logger.info(f"Total files found: {len(pdf_files)}")
         logger.info(f"Files processed: {len(files_to_process)}")
         logger.info(f"Files skipped (too small): {len(skipped_files)}")
@@ -393,8 +453,11 @@ def compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi
         logger.info(f"Failed compressions: {failed_compressions}")
 
         if successful_compressions > 0:
+            files_per_second = successful_compressions / processing_time if processing_time > 0 else 0
+            logger.info(f"Processing speed: {files_per_second:.1f} files/second")
+
             overall_compression = (
-                                          1 - total_compressed_size / total_original_size) * 100 if total_original_size > 0 else 0
+                                              1 - total_compressed_size / total_original_size) * 100 if total_original_size > 0 else 0
             logger.info(f"Total original size: {total_original_size:.2f} MB")
             logger.info(f"Total compressed size: {total_compressed_size:.2f} MB")
             logger.info(f"Overall compression ratio: {overall_compression:.1f}%")
@@ -404,143 +467,14 @@ def compress_all_pdfs_in_directory_with_backup_option(directory, color_image_dpi
             'failed': failed_compressions,
             'skipped': len(skipped_files),
             'total_original_size': total_original_size,
-            'total_compressed_size': total_compressed_size
-        }
-
-
-
-        logger.info(f"Found {len(pdf_files)} PDF files to compress")
-
-        # Group files by directory for better logging
-        files_by_dir = {}
-        for pdf_file in pdf_files:
-            parent_dir = pdf_file.parent
-            if parent_dir not in files_by_dir:
-                files_by_dir[parent_dir] = []
-            files_by_dir[parent_dir].append(pdf_file)
-
-        logger.info(f"Files distributed across {len(files_by_dir)} directories:")
-        for dir_path, files in files_by_dir.items():
-            rel_dir = get_relative_path(dir_path, directory)
-            logger.info(f"  {rel_dir}: {len(files)} files")
-
-        # Process each PDF
-        successful_compressions = 0
-        failed_compressions = 0
-        total_original_size = 0
-        total_compressed_size = 0
-
-        for i, pdf in enumerate(pdf_files, 1):
-            try:
-                # Get relative path for better logging
-                rel_path = get_relative_path(pdf, directory)
-                logger.info(f"\n--- Processing file {i}/{len(pdf_files)}: {rel_path} ---")
-
-                # Create output path maintaining directory structure
-                if replace_originals:
-                    # For replacement, maintain the same relative structure in temp directory
-                    relative_pdf_path = pdf.relative_to(directory)
-                    output_path = output_base_dir / relative_pdf_path
-                    backup_dir = backup_base_dir / relative_pdf_path.parent if backup_base_dir else None
-                else:
-                    # For separate output, maintain directory structure
-                    relative_pdf_path = pdf.relative_to(directory)
-                    output_path = output_base_dir / relative_pdf_path
-                    backup_dir = None
-
-                # Create output directory if it doesn't exist
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                if backup_dir:
-                    backup_dir.mkdir(parents=True, exist_ok=True)
-
-                # Compress PDF
-                result = compress_pdf(str(pdf), str(output_path), color_image_dpi, quality, logger)
-
-                if result['success']:
-                    total_original_size += result['original_size']
-                    total_compressed_size += result['compressed_size']
-
-                    # Replace original if requested
-                    if replace_originals:
-                        try:
-                            if create_backup:
-                                replace_original_file(pdf, output_path, backup_dir, logger)
-                            else:
-                                # Replace without backup
-                                shutil.move(str(output_path), str(pdf))
-                                logger.info(f"Original file replaced without backup: {pdf}")
-                        except Exception as e:
-                            logger.error(f"Failed to replace original file: {e}")
-                            failed_compressions += 1
-                            continue
-
-                    successful_compressions += 1
-                    logger.info(f"✓ Successfully processed: {rel_path}")
-
-            except Exception as e:
-                failed_compressions += 1
-                rel_path = get_relative_path(pdf, directory)
-                logger.error(f"✗ Failed to process {rel_path}: {e}")
-
-        # Clean up temp directory if replacing originals
-        if replace_originals and output_base_dir.exists():
-            try:
-                shutil.rmtree(output_base_dir)
-                logger.info("Temporary directory cleaned up")
-            except Exception as e:
-                logger.warning(f"Failed to clean up temporary directory: {e}")
-
-        # Summary for this directory
-        logger.info(f"\n--- DIRECTORY SUMMARY: {directory.name} ---")
-        logger.info(f"Total files processed: {len(pdf_files)}")
-        logger.info(f"Successful compressions: {successful_compressions}")
-        logger.info(f"Failed compressions: {failed_compressions}")
-
-        if successful_compressions > 0:
-            overall_compression = (
-                                          1 - total_compressed_size / total_original_size) * 100 if total_original_size > 0 else 0
-            logger.info(f"Total original size: {total_original_size:.2f} MB")
-            logger.info(f"Total compressed size: {total_compressed_size:.2f} MB")
-            logger.info(f"Overall compression ratio: {overall_compression:.1f}%")
-
-        return {
-            'successful': successful_compressions,
-            'failed': failed_compressions,
-            'total_original_size': total_original_size,
-            'total_compressed_size': total_compressed_size
+            'total_compressed_size': total_compressed_size,
+            'processing_time': processing_time
         }
 
     except Exception as e:
-        error_msg = f"Unexpected error during batch compression in {directory}: {e}"
+        error_msg = f"Unexpected error during threaded batch compression in {directory}: {e}"
         logger.error(error_msg)
         raise
-
-
-def compress_all_pdfs_in_directory(directory, color_image_dpi=150, quality="ebook", replace_originals=False,
-                                   recursive=True):
-    """Legacy function - compress all PDFs in a directory with basic settings"""
-    logger = setup_logging()
-    result = compress_all_pdfs_in_directory_with_backup_option(
-        directory, color_image_dpi, quality, replace_originals, recursive, True, 1.0, logger
-    )
-
-    # Show completion message
-    if replace_originals:
-        message = f"Compression completed!\n\nProcessed: {result['successful']}/{result['successful'] + result['failed']} files"
-        if result['skipped'] > 0:
-            message += f"\nSkipped (too small): {result['skipped']} files"
-        backup_base_dir = Path(directory) / "original_backups"
-        if backup_base_dir.exists() and result['successful'] > 0:
-            message += f"\nOriginal files backed up to: {backup_base_dir}"
-    else:
-        output_base_dir = Path(directory).parent / f"{Path(directory).name}_compressed_pdfs"
-        message = f"Compression completed!\n\nProcessed: {result['successful']}/{result['successful'] + result['failed']} files"
-        if result['skipped'] > 0:
-            message += f"\nSkipped (too small): {result['skipped']} files"
-        message += f"\nCompressed files saved to: {output_base_dir}"
-
-    messagebox.showinfo("Compression Complete", message)
-    logger.info("PDF compression session completed")
 
 
 class PDFCompressorGUI:
@@ -549,12 +483,16 @@ class PDFCompressorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("PDF Compressor - Advanced Settings")
-        self.root.geometry("750x700")
+        self.root.geometry("750x800")
         self.root.resizable(True, True)
         self.root.minsize(600, 500)
 
         # Initialize logger at startup
         self.logger = setup_logging()
+
+        # Get CPU count for threading
+        self.cpu_count = multiprocessing.cpu_count()
+        default_threads = min(max(2, self.cpu_count - 1), 16)  # Leave 1 CPU free, max 16 threads
 
         # Variables for settings
         self.selected_folders = []
@@ -562,7 +500,12 @@ class PDFCompressorGUI:
         self.quality = tk.StringVar(value="screen")
         self.recursive = tk.BooleanVar(value=True)
         self.replace_mode = tk.StringVar(value="no_replace")
-        self.min_file_size = tk.DoubleVar(value=1.0)  # Minimum file size in MB
+        self.min_file_size = tk.DoubleVar(value=1.0)
+        self.max_threads = tk.IntVar(value=default_threads)
+
+        # Threading control
+        self.processing_thread = None
+        self.stop_processing = threading.Event()
 
         # Progress tracking variables
         self.progress_var = tk.DoubleVar(value=0)
@@ -571,10 +514,11 @@ class PDFCompressorGUI:
         # Status
         self.status_text = tk.StringVar(value="Ready to compress PDFs")
 
+        # Create UI
         self.setup_ui()
 
     def setup_ui(self):
-        # Create main canvas with scrollbar for the entire interface
+        # Create main canvas with scrollbar
         canvas = tk.Canvas(self.root)
         scrollbar = tk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
         scrollable_frame = tk.Frame(canvas)
@@ -587,7 +531,6 @@ class PDFCompressorGUI:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        # Pack canvas and scrollbar
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
@@ -595,16 +538,9 @@ class PDFCompressorGUI:
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-        def _bind_to_mousewheel(event):
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
-        def _unbind_from_mousewheel(event):
-            canvas.unbind_all("<MouseWheel>")
-
-        canvas.bind('<Enter>', _bind_to_mousewheel)
-        canvas.bind('<Leave>', _unbind_from_mousewheel)
-
-        # Main frame with padding (now inside scrollable_frame)
+        # Main frame
         main_frame = tk.Frame(scrollable_frame, padx=20, pady=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -614,7 +550,29 @@ class PDFCompressorGUI:
         title_label.pack(pady=(0, 20))
 
         # Folder selection frame
-        folder_frame = tk.LabelFrame(main_frame, text="Folder Selection", padx=10, pady=10)
+        self.create_folder_selection_frame(main_frame)
+
+        # Compression settings frame
+        self.create_compression_settings_frame(main_frame)
+
+        # Processing options frame
+        self.create_processing_options_frame(main_frame)
+
+        # Progress frame
+        self.create_progress_frame(main_frame)
+
+        # Action buttons frame
+        self.create_action_buttons_frame(main_frame)
+
+        # Status frame
+        self.create_status_frame(main_frame)
+
+        # Info frame
+        self.create_info_frame(main_frame)
+
+    def create_folder_selection_frame(self, parent):
+        """Create folder selection UI components"""
+        folder_frame = tk.LabelFrame(parent, text="Folder Selection", padx=10, pady=10)
         folder_frame.pack(fill=tk.X, pady=10)
 
         # Add folder controls
@@ -625,7 +583,6 @@ class PDFCompressorGUI:
                                command=self.add_folder, bg="lightgreen", font=("Arial", 10, "bold"))
         add_button.pack(side=tk.LEFT)
 
-        # Add Excel import button
         excel_button = tk.Button(add_folder_frame, text="📊 Import from Excel",
                                  command=self.import_from_excel, bg="lightblue", font=("Arial", 10, "bold"))
         excel_button.pack(side=tk.LEFT, padx=(10, 0))
@@ -634,31 +591,41 @@ class PDFCompressorGUI:
                                  command=self.clear_folders, bg="lightcoral")
         clear_button.pack(side=tk.LEFT, padx=(10, 0))
 
-        # Selected folders listbox with scrollbar
+        # Selected folders listbox
         listbox_frame = tk.Frame(folder_frame)
         listbox_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
-        scrollbar = tk.Scrollbar(listbox_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox_scrollbar = tk.Scrollbar(listbox_frame)
+        listbox_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.folders_listbox = tk.Listbox(listbox_frame, yscrollcommand=scrollbar.set,
+        self.folders_listbox = tk.Listbox(listbox_frame, yscrollcommand=listbox_scrollbar.set,
                                           height=5, font=("Arial", 9))
         self.folders_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.folders_listbox.yview)
+        listbox_scrollbar.config(command=self.folders_listbox.yview)
 
-        # Add double-click to remove
         self.folders_listbox.bind("<Double-Button-1>", self.remove_selected_folder)
 
         remove_button = tk.Button(folder_frame, text="Remove Selected",
                                   command=self.remove_selected_folder, bg="orange")
         remove_button.pack(pady=5)
 
-        # Compression settings frame
-        settings_frame = tk.LabelFrame(main_frame, text="Compression Settings", padx=10, pady=10)
+    def create_compression_settings_frame(self, parent):
+        """Create compression settings UI components"""
+        settings_frame = tk.LabelFrame(parent, text="Compression Settings", padx=10, pady=10)
         settings_frame.pack(fill=tk.X, pady=10)
 
-        # Color Image DPI setting
-        dpi_frame = tk.Frame(settings_frame)
+        # DPI setting
+        self.create_dpi_setting(settings_frame)
+
+        # File size setting
+        self.create_file_size_setting(settings_frame)
+
+        # Threading setting
+        self.create_threading_setting(settings_frame)
+
+    def create_dpi_setting(self, parent):
+        """Create DPI setting controls"""
+        dpi_frame = tk.Frame(parent)
         dpi_frame.pack(fill=tk.X, pady=5)
 
         tk.Label(dpi_frame, text="Color Image DPI:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
@@ -666,13 +633,15 @@ class PDFCompressorGUI:
         dpi_control_frame = tk.Frame(dpi_frame)
         dpi_control_frame.pack(fill=tk.X, pady=2)
 
+        # Create label first
+        self.dpi_label = tk.Label(dpi_control_frame, text="150 DPI",
+                                  font=("Arial", 10), fg="darkgreen")
+
         dpi_scale = tk.Scale(dpi_control_frame, from_=72, to=600,
                              variable=self.color_image_dpi, orient=tk.HORIZONTAL,
                              length=300, command=self.update_dpi_label)
         dpi_scale.pack(side=tk.LEFT)
 
-        self.dpi_label = tk.Label(dpi_control_frame, text="150 DPI",
-                                  font=("Arial", 10), fg="darkgreen")
         self.dpi_label.pack(side=tk.LEFT, padx=(10, 0))
 
         # DPI presets
@@ -686,8 +655,9 @@ class PDFCompressorGUI:
         tk.Button(dpi_presets_frame, text="High (300)",
                   command=lambda: self.set_dpi(300), bg="lightgreen").pack(side=tk.LEFT, padx=2)
 
-        # Minimum file size setting
-        size_frame = tk.Frame(settings_frame)
+    def create_file_size_setting(self, parent):
+        """Create file size setting controls"""
+        size_frame = tk.Frame(parent)
         size_frame.pack(fill=tk.X, pady=5)
 
         tk.Label(size_frame, text="Skip files smaller than:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
@@ -695,13 +665,15 @@ class PDFCompressorGUI:
         size_control_frame = tk.Frame(size_frame)
         size_control_frame.pack(fill=tk.X, pady=2)
 
+        # Create label first
+        self.size_label = tk.Label(size_control_frame, text="1.0 MB",
+                                   font=("Arial", 10), fg="darkgreen")
+
         size_scale = tk.Scale(size_control_frame, from_=0.1, to=10.0,
                               variable=self.min_file_size, orient=tk.HORIZONTAL,
                               length=300, resolution=0.1, command=self.update_size_label)
         size_scale.pack(side=tk.LEFT)
 
-        self.size_label = tk.Label(size_control_frame, text="1.0 MB",
-                                   font=("Arial", 10), fg="darkgreen")
         self.size_label.pack(side=tk.LEFT, padx=(10, 0))
 
         # Size presets
@@ -717,8 +689,54 @@ class PDFCompressorGUI:
         tk.Button(size_presets_frame, text="Large Files (10 MB)",
                   command=lambda: self.set_min_size(10.0), bg="lightblue").pack(side=tk.LEFT, padx=2)
 
-        # Processing options frame
-        options_frame = tk.LabelFrame(main_frame, text="Processing Options", padx=10, pady=10)
+    def create_threading_setting(self, parent):
+        """Create threading setting controls"""
+        threading_frame = tk.Frame(parent)
+        threading_frame.pack(fill=tk.X, pady=5)
+
+        # Threading info label
+        cpu_info = f"CPU cores detected: {self.cpu_count}"
+        tk.Label(threading_frame, text=f"Parallel threads: ({cpu_info})", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+
+        thread_control_frame = tk.Frame(threading_frame)
+        thread_control_frame.pack(fill=tk.X, pady=2)
+
+        # Create label first
+        self.thread_label = tk.Label(thread_control_frame, text=f"{self.max_threads.get()} threads",
+                                     font=("Arial", 10), fg="darkgreen")
+
+        # Dynamic max threads based on CPU count
+        max_threads_limit = min(self.cpu_count * 2, 32)  # Allow up to 2x CPU cores, max 32
+
+        thread_scale = tk.Scale(thread_control_frame, from_=1, to=max_threads_limit,
+                                variable=self.max_threads, orient=tk.HORIZONTAL,
+                                length=300, command=self.update_thread_label)
+        thread_scale.pack(side=tk.LEFT)
+
+        self.thread_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Thread presets
+        thread_presets_frame = tk.Frame(threading_frame)
+        thread_presets_frame.pack(fill=tk.X, pady=5)
+
+        # Dynamic presets based on CPU count
+        preset_single = 1
+        preset_balanced = max(2, self.cpu_count // 2)
+        preset_fast = max(4, self.cpu_count - 1)
+        preset_max = min(self.cpu_count * 2, 16)
+
+        tk.Button(thread_presets_frame, text=f"Single ({preset_single})",
+                  command=lambda: self.set_threads(preset_single), bg="lightcoral").pack(side=tk.LEFT, padx=2)
+        tk.Button(thread_presets_frame, text=f"Balanced ({preset_balanced})",
+                  command=lambda: self.set_threads(preset_balanced), bg="lightyellow").pack(side=tk.LEFT, padx=2)
+        tk.Button(thread_presets_frame, text=f"Fast ({preset_fast})",
+                  command=lambda: self.set_threads(preset_fast), bg="lightgreen").pack(side=tk.LEFT, padx=2)
+        tk.Button(thread_presets_frame, text=f"Maximum ({preset_max})",
+                  command=lambda: self.set_threads(preset_max), bg="lightblue").pack(side=tk.LEFT, padx=2)
+
+    def create_processing_options_frame(self, parent):
+        """Create processing options UI components"""
+        options_frame = tk.LabelFrame(parent, text="Processing Options", padx=10, pady=10)
         options_frame.pack(fill=tk.X, pady=10)
 
         # Recursive processing
@@ -739,8 +757,9 @@ class PDFCompressorGUI:
             tk.Radiobutton(options_frame, text=text, variable=self.replace_mode,
                            value=value, font=("Arial", 9)).pack(anchor=tk.W, pady=1)
 
-        # Progress frame
-        progress_frame = tk.LabelFrame(main_frame, text="Progress", padx=10, pady=10)
+    def create_progress_frame(self, parent):
+        """Create progress UI components"""
+        progress_frame = tk.LabelFrame(parent, text="Progress", padx=10, pady=10)
         progress_frame.pack(fill=tk.X, pady=10)
 
         # Progress bar
@@ -753,34 +772,37 @@ class PDFCompressorGUI:
                                           font=("Arial", 9), fg="darkblue", wraplength=650)
         progress_details_label.pack(anchor=tk.W)
 
-        # Action buttons frame
-        buttons_frame = tk.Frame(main_frame)
+    def create_action_buttons_frame(self, parent):
+        """Create action buttons UI components"""
+        buttons_frame = tk.Frame(parent)
         buttons_frame.pack(fill=tk.X, pady=15)
 
         # Start compression button
-        start_button = tk.Button(buttons_frame, text="Start Compression",
-                                 command=self.start_compression,
-                                 bg="green", fg="white", font=("Arial", 12, "bold"),
-                                 height=2, width=15)
-        start_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+        self.start_button = tk.Button(buttons_frame, text="Start Compression",
+                                      command=self.start_compression,
+                                      bg="green", fg="white", font=("Arial", 12, "bold"),
+                                      height=2, width=15)
+        self.start_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
 
-        # Clear/Reset button
+        # Reset button
         reset_button = tk.Button(buttons_frame, text="Reset Settings",
                                  command=self.reset_settings,
                                  bg="orange", fg="white", font=("Arial", 12, "bold"),
                                  height=2, width=15)
         reset_button.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(5, 0))
 
-        # Status frame
-        status_frame = tk.LabelFrame(main_frame, text="Status", padx=10, pady=8)
+    def create_status_frame(self, parent):
+        """Create status UI components"""
+        status_frame = tk.LabelFrame(parent, text="Status", padx=10, pady=8)
         status_frame.pack(fill=tk.X, pady=8)
 
         status_label = tk.Label(status_frame, textvariable=self.status_text,
                                 font=("Arial", 10), fg="blue", wraplength=650)
         status_label.pack(anchor=tk.W)
 
-        # Info frame
-        info_frame = tk.LabelFrame(main_frame, text="Information", padx=10, pady=5)
+    def create_info_frame(self, parent):
+        """Create info UI components"""
+        info_frame = tk.LabelFrame(parent, text="Information", padx=10, pady=5)
         info_frame.pack(fill=tk.X, pady=5)
 
         info_text = tk.Text(info_frame, height=4, wrap=tk.WORD, font=("Arial", 9))
@@ -789,11 +811,12 @@ class PDFCompressorGUI:
                          "• Double-click on folder list to remove a folder\n"
                          "• Use Color Image DPI to control compression level (lower = smaller files)\n"
                          "• Set minimum file size to skip small files that don't need compression\n"
-                         "• Screen quality preset is used for all compressions (optimized for web/email)\n"
+                         f"• Threads auto-detected: {self.cpu_count} CPU cores, max {min(self.cpu_count * 2, 32)} threads\n"
                          "• Import from Excel: First column should contain folder paths\n"
                          "• All logs are saved in the 'logs' folder next to the application")
         info_text.config(state=tk.DISABLED)
 
+    # Event handlers and utility methods
     def update_dpi_label(self, value):
         """Update DPI label when scale changes"""
         dpi_val = int(float(value))
@@ -804,6 +827,11 @@ class PDFCompressorGUI:
         size_val = float(value)
         self.size_label.config(text=f"{size_val:.1f} MB")
 
+    def update_thread_label(self, value):
+        """Update thread label when scale changes"""
+        thread_val = int(float(value))
+        self.thread_label.config(text=f"{thread_val} threads")
+
     def set_dpi(self, dpi_value):
         """Set DPI to specific value"""
         self.color_image_dpi.set(dpi_value)
@@ -813,6 +841,11 @@ class PDFCompressorGUI:
         """Set minimum file size to specific value"""
         self.min_file_size.set(size_value)
         self.update_size_label(size_value)
+
+    def set_threads(self, thread_value):
+        """Set number of threads to specific value"""
+        self.max_threads.set(thread_value)
+        self.update_thread_label(thread_value)
 
     def add_folder(self):
         """Add a folder to the selection list"""
@@ -849,7 +882,7 @@ class PDFCompressorGUI:
 
         try:
             # Try reading with pandas first
-            if 'pandas' in sys.modules or 'pd' in globals():
+            if 'pd' in globals():
                 paths = self.read_excel_with_pandas(excel_file)
             else:
                 paths = self.read_excel_with_openpyxl(excel_file)
@@ -866,22 +899,14 @@ class PDFCompressorGUI:
                 path_str = str(path_str).strip()
                 path_obj = Path(path_str)
 
-                # Check if path exists
-                if not path_obj.exists():
+                if not path_obj.exists() or not path_obj.is_dir():
                     invalid_count += 1
                     continue
 
-                # Check if path is a directory
-                if not path_obj.is_dir():
-                    invalid_count += 1
-                    continue
-
-                # Check if already in list
                 if path_str in self.selected_folders:
                     skipped_count += 1
                     continue
 
-                # Add to list
                 self.selected_folders.append(path_str)
                 self.folders_listbox.insert(tk.END, path_str)
                 added_count += 1
@@ -909,7 +934,6 @@ class PDFCompressorGUI:
     def read_excel_with_pandas(self, excel_file):
         """Read Excel file using pandas"""
         try:
-            # Read first column only
             df = pd.read_excel(excel_file, usecols=[0], header=None)
             return df.iloc[:, 0].dropna().tolist()
         except Exception as e:
@@ -958,11 +982,13 @@ class PDFCompressorGUI:
         self.recursive.set(True)
         self.replace_mode.set("no_replace")
         self.min_file_size.set(1.0)
+        self.max_threads.set(min(max(2, self.cpu_count - 1), 16))
         self.status_text.set("Settings reset to defaults")
         self.progress_details.set("")
         self.progress_var.set(0)
         self.update_dpi_label(150)
         self.update_size_label(1.0)
+        self.update_thread_label(self.max_threads.get())
 
     def start_compression(self):
         """Start the compression process"""
@@ -982,6 +1008,7 @@ class PDFCompressorGUI:
         recursive = self.recursive.get()
         replace_mode = self.replace_mode.get()
         min_file_size = self.min_file_size.get()
+        max_threads = self.max_threads.get()
 
         # Convert replace mode to boolean values
         replace_originals = replace_mode in ["replace_with_backup", "replace_without_backup"]
@@ -995,6 +1022,7 @@ Selected Folders: {len(self.selected_folders)} folder(s)
 
 Color Image DPI: {color_image_dpi}
 Minimum file size: {min_file_size:.1f} MB
+Parallel threads: {max_threads}
 Process subdirectories: {'Yes' if recursive else 'No'}
 File handling: {
         'Keep originals (create new files)' if replace_mode == 'no_replace'
@@ -1007,14 +1035,25 @@ Do you want to start compression with these settings?"""
         if not messagebox.askyesno("Confirm Compression", settings_summary):
             return
 
-        # Reset progress
+        # Reset progress and start processing
         self.progress_var.set(0)
         self.progress_details.set("")
-
-        # Update status
+        self.stop_processing.clear()
         self.status_text.set("Starting compression...")
+        self.start_button.config(state='disabled')
         self.root.update()
 
+        # Start processing in separate thread
+        self.processing_thread = threading.Thread(
+            target=self.run_compression_threaded,
+            args=(color_image_dpi, quality, recursive, replace_originals, create_backup, min_file_size, max_threads)
+        )
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+
+    def run_compression_threaded(self, color_image_dpi, quality, recursive, replace_originals, create_backup,
+                                 min_file_size, max_threads):
+        """Run compression in separate thread"""
         try:
             self.logger.info("\n" + "=" * 60)
             self.logger.info("BULK PDF COMPRESSION SESSION STARTED")
@@ -1022,10 +1061,8 @@ Do you want to start compression with these settings?"""
             self.logger.info(f"Total folders to process: {len(self.selected_folders)}")
             self.logger.info(f"Settings: DPI={color_image_dpi}, Quality={quality}, Recursive={recursive}")
             self.logger.info(f"Minimum file size: {min_file_size:.1f} MB")
-            self.logger.info(f"Replace mode: {replace_mode}")
-
-            print("Starting PDF compression...")
-            print("Check the console and log files for detailed progress...")
+            self.logger.info(f"Parallel threads: {max_threads}")
+            self.logger.info(f"Replace mode: {replace_originals}")
 
             # Process each folder
             total_processed = 0
@@ -1034,19 +1071,22 @@ Do you want to start compression with these settings?"""
             total_skipped = 0
             total_original_size = 0
             total_compressed_size = 0
+            start_time = time.time()
 
             for i, folder in enumerate(self.selected_folders, 1):
+                if self.stop_processing.is_set():
+                    break
+
                 folder_progress = (i - 1) / len(self.selected_folders) * 100
-                self.progress_var.set(folder_progress)
+                self.root.after(0, lambda p=folder_progress: self.progress_var.set(p))
+                self.root.after(0, lambda i=i, folder=folder: self.status_text.set(
+                    f"Processing folder {i}/{len(self.selected_folders)}: {Path(folder).name}"))
+                self.root.after(0, lambda folder=folder: self.progress_details.set(f"Folder: {folder}"))
 
-                self.status_text.set(f"Processing folder {i}/{len(self.selected_folders)}: {Path(folder).name}")
-                self.progress_details.set(f"Folder: {folder}")
-                self.root.update()
-
-                # Process folder with progress callback
-                result = self.compress_folder_with_progress(
-                    folder, color_image_dpi, quality, replace_originals, recursive, create_backup, min_file_size, i,
-                    len(self.selected_folders)
+                # Process folder with threading
+                result = compress_all_pdfs_in_directory_threaded(
+                    folder, color_image_dpi, quality, replace_originals, recursive, create_backup, min_file_size,
+                    max_threads, self.logger
                 )
 
                 total_processed += 1
@@ -1056,30 +1096,41 @@ Do you want to start compression with these settings?"""
                 total_original_size += result.get('total_original_size', 0)
                 total_compressed_size += result.get('total_compressed_size', 0)
 
+            # Calculate processing time
+            end_time = time.time()
+            processing_time = end_time - start_time
+
             # Final update
-            self.progress_var.set(100)
-            self.status_text.set(f"Compression completed! Processed {total_processed} folder(s)")
-            self.progress_details.set(
-                f"Total: {total_successful} successful, {total_failed} failed, {total_skipped} skipped")
+            self.root.after(0, lambda: self.progress_var.set(100))
+            self.root.after(0, lambda: self.status_text.set(
+                f"Compression completed! Processed {total_processed} folder(s)"))
+            self.root.after(0, lambda: self.progress_details.set(
+                f"Total: {total_successful} successful, {total_failed} failed, {total_skipped} skipped"))
 
             # Final session summary
             self.logger.info("\n" + "=" * 60)
             self.logger.info("BULK COMPRESSION SESSION SUMMARY")
             self.logger.info("=" * 60)
+            self.logger.info(f"Processing time: {processing_time:.1f} seconds")
             self.logger.info(f"Folders processed: {total_processed}")
             self.logger.info(f"Total files successful: {total_successful}")
             self.logger.info(f"Total files failed: {total_failed}")
             self.logger.info(f"Total files skipped: {total_skipped}")
+
             if total_successful > 0:
                 overall_compression = (
                                                   1 - total_compressed_size / total_original_size) * 100 if total_original_size > 0 else 0
+                files_per_second = total_successful / processing_time if processing_time > 0 else 0
                 self.logger.info(f"Total original size: {total_original_size:.2f} MB")
                 self.logger.info(f"Total compressed size: {total_compressed_size:.2f} MB")
                 self.logger.info(f"Overall compression ratio: {overall_compression:.1f}%")
+                self.logger.info(f"Processing speed: {files_per_second:.1f} files/second")
+
             self.logger.info("Session completed successfully")
 
             # Show final summary
             summary_msg = f"Compression completed!\n\n"
+            summary_msg += f"Processing time: {processing_time:.1f} seconds\n"
             summary_msg += f"Folders processed: {total_processed}\n"
             summary_msg += f"Files successful: {total_successful}\n"
             if total_failed > 0:
@@ -1089,50 +1140,22 @@ Do you want to start compression with these settings?"""
             if total_successful > 0:
                 overall_compression = (
                                                   1 - total_compressed_size / total_original_size) * 100 if total_original_size > 0 else 0
+                files_per_second = total_successful / processing_time if processing_time > 0 else 0
                 summary_msg += f"Total space saved: {overall_compression:.1f}%\n"
+                summary_msg += f"Speed: {files_per_second:.1f} files/second\n"
             summary_msg += f"\nDetailed logs saved in the 'logs' folder."
 
-            messagebox.showinfo("Compression Complete", summary_msg)
+            self.root.after(0, lambda: messagebox.showinfo("Compression Complete", summary_msg))
 
         except Exception as e:
             error_msg = f"Compression failed: {str(e)}"
             self.logger.error(f"Application error: {e}")
-            messagebox.showerror("Compression Error", error_msg)
-            self.status_text.set("Compression failed!")
-            self.progress_details.set("Error occurred")
-
-    def compress_folder_with_progress(self, folder, color_image_dpi, quality, replace_originals, recursive,
-                                      create_backup, min_file_size, folder_index, total_folders):
-        """Compress folder with progress updates"""
-        try:
-            # Get all PDF files first to calculate progress
-            pdf_files = find_all_pdfs(folder, recursive)
-            if not pdf_files:
-                self.progress_details.set(f"No PDF files found in {Path(folder).name}")
-                self.logger.warning(f"No PDF files found in {folder}")
-                return {'successful': 0, 'failed': 0, 'skipped': 0, 'total_original_size': 0,
-                        'total_compressed_size': 0}
-
-            # Use the main logger for all operations
-            result = compress_all_pdfs_in_directory_with_backup_option(
-                folder, color_image_dpi, quality, replace_originals, recursive, create_backup, min_file_size,
-                self.logger
-            )
-
-            # Update progress for individual files within this folder
-            for i, pdf_file in enumerate(pdf_files, 1):
-                folder_progress = ((folder_index - 1) + (i / len(pdf_files))) / total_folders * 100
-                self.progress_var.set(folder_progress)
-
-                rel_path = get_relative_path(pdf_file, Path(folder))
-                self.progress_details.set(f"Processing: {rel_path} ({i}/{len(pdf_files)})")
-                self.root.update()
-
-            return result
-
-        except Exception as e:
-            self.logger.error(f"Error processing folder {folder}: {e}")
-            return {'successful': 0, 'failed': 1, 'skipped': 0, 'total_original_size': 0, 'total_compressed_size': 0}
+            self.root.after(0, lambda: messagebox.showerror("Compression Error", error_msg))
+            self.root.after(0, lambda: self.status_text.set("Compression failed!"))
+            self.root.after(0, lambda: self.progress_details.set("Error occurred"))
+        finally:
+            # Re-enable controls
+            self.root.after(0, lambda: self.start_button.config(state='normal'))
 
 
 def main():
